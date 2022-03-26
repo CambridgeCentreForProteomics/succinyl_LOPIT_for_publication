@@ -1,0 +1,317 @@
+---
+title: "Classify major localisation"
+author:
+  - name: "Tom Smith"
+    affiliation: "Cambridge Centre for Proteomics"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+abstract: | 
+  Here we classify proteins/peptides according to their marker profiles in the
+  unenriched/unmodified LOPIT, using SVM
+output:
+  pdf_document:
+  html_notebook: default
+geometry: margin=1in
+fontsize: 11pt
+---
+
+```{r}
+library(camprotR)
+library(tidyverse)
+library(MSnbase)
+library(pRoloc)
+library(biomaRt)
+```
+
+```{r}
+pep_classifications <- readRDS('../results/pep_classifications.rds')
+```
+
+```{r}
+table(fData(pep_classifications)$filtered_ptm)
+
+pep_classifications_per_loc <- pep_classifications %>%
+  fData() %>%
+  filter(filtered_ptm=='Succinyl', svm_filtered_ind_thresh!='unknown') %>%
+  group_by(filtered_ptm, svm_filtered_ind_thresh) %>%
+  tally() %>%
+  arrange(desc(n))
+
+print(pep_classifications_per_loc)
+write.table(pep_classifications_per_loc, here('results/pep_classifications_per_loc.tsv'),
+            sep='\t', quote=FALSE, row.names=FALSE)
+
+pep_classifications_per_protein_per_loc <- pep_classifications %>%
+  fData() %>%
+  filter(filtered_ptm=='Succinyl', svm_filtered_ind_thresh!='unknown') %>%
+  dplyr::select(filtered_ptm, Master.Protein.Accessions, svm_filtered_ind_thresh) %>%
+  unique() %>%
+  group_by(filtered_ptm, svm_filtered_ind_thresh) %>%
+  tally() %>%
+  arrange(desc(n))
+
+pep_classifications_per_protein_per_loc
+  
+p <- pep_classifications %>%
+  fData() %>%
+  filter(filtered_ptm %in% c('Succinyl', NA), svm_filtered_ind_thresh!='unknown') %>%
+  group_by(filtered_ptm, svm_filtered_ind_thresh) %>%
+  tally() %>%
+  mutate(filtered_ptm=ifelse(is.na(filtered_ptm), 'Unmodified', filtered_ptm)) %>%
+  ggplot(aes(svm_filtered_ind_thresh, n)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~filtered_ptm, scales='free') +
+  theme_camprot(base_size=15, base_family='sans') +
+  theme(axis.text.x=element_text(angle=45, vjust=1, hjust=1),
+        strip.background=element_blank()) +
+  xlab('Localisation assignment') +
+  ylab('Peptides')
+
+print(p)
+ggsave('../figures/classification_counts.png')
+ggsave('../figures/classification_counts.pdf')
+
+```
+
+
+Finally, let's look at the enriched GO terms for the succinylated nuclear proteins. As part of this, we will consider the potential biasing factor of protein abundance. Note that the bias (if present) would be technical (easier to detect high abundance), even if more abundant proteins are more likely to have a least one succinylated copy, since the proportion succinylated should not be dependent on abundance, so it still comes down to a difference in the ability to detect low vs high frequency events. We will use PaxDB for this, specifically the Geiger et al U-2 OS data.
+```{r}
+u2os_abundances <- read.table('../shared_files/9606-iBAQ_U2OS_Geiger_2012_uniprot.txt')
+colnames(u2os_abundances) <- c('internal_id', 'string_id', 'abundance')
+
+u2os_abundances <- u2os_abundances %>%
+  separate(string_id, into=c(NA, 'ensembl_peptide_id'))
+
+
+```
+
+```{r}
+ensembl <- biomaRt::useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+peptide2uniprot <- getBM(attributes=c('ensembl_peptide_id', 'uniprotswissprot'),
+                         mart = ensembl,
+                         filters = 'ensembl_peptide_id',
+                         values=u2os_abundances$ensembl_peptide_id)
+
+peptide2uniprot <- peptide2uniprot %>%
+  filter(ensembl_peptide_id!='', uniprotswissprot!='')
+
+duplicated_pep_id <- names(table(peptide2uniprot$ensembl_peptide_id))[
+  table(peptide2uniprot$ensembl_peptide_id)>1]
+
+duplicated_uniprot_id <- names(table(peptide2uniprot$uniprotswissprot))[
+  table(peptide2uniprot$uniprotswissprot)>1]
+
+print(dim(peptide2uniprot))
+peptide2uniprot <- peptide2uniprot %>%
+  filter(!ensembl_peptide_id %in% duplicated_pep_id,
+         !uniprotswissprot %in% duplicated_uniprot_id)
+
+print(dim(peptide2uniprot))
+
+u2os_abundances_uniprot <- merge(u2os_abundances, peptide2uniprot, by='ensembl_peptide_id')
+
+
+```
+
+
+```{r}
+
+x <- pep_classifications %>%
+  fData() %>%
+  filter(is.na(filtered_ptm))
+
+x %>% dplyr::select(Master.Protein.Accessions) %>%
+  unique()
+
+nuc_abundances <- pep_classifications%>%
+  fData() %>%
+  filter(svm_filtered_single_threshold=='Nucleus') %>%
+  dplyr::select(Master.Protein.Accessions) %>%
+  unique() %>%
+  merge(u2os_abundances_uniprot, by.x='Master.Protein.Accessions', by.y='uniprotswissprot') %>%
+  mutate(binned_abundance=Hmisc::cut2(abundance, g=10))
+
+table(nuc_abundances$binned_abundance)
+
+nuc_suc_tally_by_abundance <- pep_classifications %>%
+  fData() %>%
+  filter(filtered_ptm == 'Succinyl',
+         svm_filtered_ind_thresh=='Nucleus') %>%
+  dplyr::select(Master.Protein.Accessions, filtered_ptm) %>%
+  unique() %>%
+  merge(nuc_abundances, by='Master.Protein.Accessions', all.y=TRUE) %>%
+  group_by(binned_abundance, suc=filtered_ptm=='Succinyl') %>%
+  tally()
+
+
+```
+
+
+```{r}
+library(ggrepel)
+
+p <- nuc_suc_tally_by_abundance %>%
+  pivot_wider(names_from='suc', values_from='n') %>%
+  mutate(suc=ifelse(is.na(`TRUE`), 0, `TRUE`)) %>%
+  mutate(fraction=100*suc/(suc+`NA`)) %>%
+  ggplot(aes(binned_abundance, fraction)) +
+  geom_point() +
+  geom_text(aes(label=suc, hjust=1, y=fraction+2)) +
+  geom_line(group=1) +
+  theme_camprot(border=FALSE, base_size=15, base_family='sans') +
+  scale_x_discrete(labels=1:10) +
+  theme(axis.text.x=element_blank()) +
+  xlab('\nProtein abundace decile') +
+  ylab('Succinylated (%)')
+
+print(p)
+ggsave('../figures/nuclear_succ_proteins_abundance.png')
+ggsave('../figures/nuclear_succ_proteins_abundance.pdf')
+```
+
+
+```{r}
+all_abundances <- pep_classifications %>%
+  fData() %>%
+  filter(svm_filtered_single_threshold!='unknown') %>%
+  dplyr::select(svm_filtered_ind_thresh, Master.Protein.Accessions) %>%
+  unique() %>%
+  merge(u2os_abundances_uniprot, by.x='Master.Protein.Accessions', by.y='uniprotswissprot') %>%
+  mutate(binned_abundance=Hmisc::cut2(abundance, g=10))
+
+all_suc_tally_by_abundance <- pep_classifications %>%
+  fData() %>%
+  filter(filtered_ptm == 'Succinyl',
+         svm_filtered_ind_thresh!='unknown') %>%
+  dplyr::select(Master.Protein.Accessions, filtered_ptm, svm_filtered_ind_thresh) %>%
+  unique() %>%
+  merge(all_abundances, by=c('svm_filtered_ind_thresh', 'Master.Protein.Accessions'), all.y=TRUE) %>%
+  group_by(svm_filtered_ind_thresh, binned_abundance, suc=filtered_ptm=='Succinyl') %>%
+  tally()
+
+n_proteins_per_loc <- all_suc_tally_by_abundance %>%
+  group_by(svm_filtered_ind_thresh) %>%
+  summarise(n=sum(n))
+
+keep_loc <- n_proteins_per_loc %>% filter(n>200) %>%
+  pull(svm_filtered_ind_thresh) %>%
+  setdiff(c('unknown', 'Proteasome'))
+
+p <- all_suc_tally_by_abundance %>%
+  filter(svm_filtered_ind_thresh %in% keep_loc) %>%
+  mutate(svm_filtered_ind_thresh=factor(
+    svm_filtered_ind_thresh,
+    levels=c(setdiff(keep_loc, 'Mitochondria'), 'Mitochondria'))) %>%
+  pivot_wider(names_from='suc', values_from='n') %>%
+  mutate(suc=ifelse(is.na(`TRUE`), 0, `TRUE`)) %>%
+  mutate(fraction=100*suc/(suc+`NA`)) %>%
+  ggplot(aes(binned_abundance, fraction,
+             colour=svm_filtered_ind_thresh,
+             group=svm_filtered_ind_thresh)) +
+  geom_point() +
+  geom_line() +
+  theme_camprot(border=FALSE, base_size=15) +
+  theme(axis.text.x=element_text(angle=45, vjust=1, hjust=1)) +
+  xlab('Protein abundace (Geiger et al; iBAQ)') +
+  ylab('Succinylated (%)') +
+  scale_colour_manual(values=c(get_cat_palette(length(keep_loc)-1), 'grey20'),
+                      name='Localisation')
+
+print(p)
+
+all_suc_tally_by_abundance %>%
+  filter(svm_filtered_ind_thresh %in% keep_loc) %>%
+  group_by(svm_filtered_ind_thresh, binned_abundance) %>%
+  summarise(n=sum(n)) %>%
+  ggplot(aes(binned_abundance, n)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~svm_filtered_ind_thresh, scales='free') +
+  theme_camprot(border=FALSE, base_size = 10) +
+  theme(axis.text.x=element_text(angle=45, vjust=1, hjust=1, size=5))
+  
+```
+
+OK, so as expected, clear relationship between proteins abundance and proportion for which we detect succinylated peptides, with ~40% of the most abundant decile having observed succinylated peptides. Strangely though, there are quite succinylated proteins from the lowest 3 deciles too. Regardless, there's a strong relationship that we should take into account for the GO enrichment. It's not quite monotonic but close enough to use goseq out of the box
+```{r}
+library(goseq)
+go_human <- readRDS('../shared_files/h_sapiens_go_full.rds')
+
+```
+
+
+```{r}
+
+
+nuc_suc <- pep_classifications %>%
+  fData() %>%
+  filter(filtered_ptm == 'Succinyl',
+         svm_filtered_single_threshold=='Nucleus') %>%
+  pull(Master.Protein.Accessions)
+
+for_go_seq <- nuc_abundances %>% mutate(succinylated=Master.Protein.Accessions %in% nuc_suc)
+
+is_suc <- for_go_seq$succinylated
+names(is_suc) <- for_go_seq$Master.Protein.Accessions
+table(for_go_seq$succinylated)
+
+bias <- for_go_seq$abundance
+names(bias) <- for_go_seq$Master.Protein.Accessions
+
+pwf <- goseq::nullp(is_suc, bias.data=bias)
+```
+
+OK, so goseq::nullp doesn't fit the relationship quite right.  Below, we allow for more knots to improve the fit
+
+```{r}
+my_nullp <- function (DEgenes, genome, id, bias.data = NULL, plot.fit = TRUE,
+                      nknots=6) # default value in goseq::nullp
+{
+    if (!is.null(bias.data) & length(bias.data) != length(DEgenes)) {
+        stop("bias.data vector must have the same length as DEgenes vector!")
+    }
+    bias.data = unfactor(bias.data)
+    DEgenes = unfactor(DEgenes)
+    if (is.null(bias.data)) {
+        bias.data = getlength(names(DEgenes), genome, id)
+    }
+    pwf = rep(NA, length(DEgenes))
+    w = !is.na(bias.data)
+    pwf[w] = goseq::makespline(bias.data[w], DEgenes[w], nKnots = nknots)
+    out = data.frame(DEgenes = DEgenes, bias.data = bias.data, 
+        pwf = pwf, stringsAsFactors = FALSE)
+    rownames(out) = names(DEgenes)
+    if (plot.fit) {
+        plotPWF(out, ylim=c(0, 0.6))
+    }
+    out
+}
+
+pwf_more_knots <- my_nullp(is_suc, bias.data=bias, nknots=17)
+
+```
+
+```{r}
+
+go_enriched_finalised <- camprotR::get_enriched_go(pwf_more_knots, gene2cat=go_human)
+
+go_enriched_finalised <- go_enriched_finalised %>%
+  filter(over_represented_adj_pval<0.05) %>%
+  camprotR::remove_redundant_go() %>%
+  camprotR::estimate_go_overrep((pwf_more_knots %>% mutate(pwf=1)), go_human)  %>%  # calculate naive raw over-representation
+  mutate(overrep=adj_overrep) %>%
+  dplyr::select(-adj_overrep) %>%
+  arrange(desc(overrep), over_represented_adj_pval)
+
+print(go_enriched_finalised)
+write.table(go_enriched_finalised, here('results/over_rep_go.tsv'), sep='\t', quote=FALSE, row.names=FALSE)
+```
+
+OK, so we have two clearly over-represented GO terms, the CC 'ribonucleoprotein complex' and the MF 'RNA binding'. Both are ~2-fold over-represented. And then 4 more terms with weaker over-representation. Let's see hoe many succinylated nuclear proteins are accounted for with just the top 2 over-represented terms
+
+```{r}
+proteins_in_enriched_go <- go_human %>% filter(GO.ID %in% go_enriched_finalised$category[1:2]) %>% pull(UNIPROTKB)
+for_go_seq$in_enriched <- for_go_seq$Master.Protein.Accessions %in% proteins_in_enriched_go
+table(for_go_seq$succinylated)
+table(for_go_seq$in_enriched, for_go_seq$succinylated)
+table(for_go_seq$in_enriched)
+```
+

@@ -1,0 +1,7 @@
+category	over_represented_pvalue	under_represented_pvalue	numDEInCat	numInCat	term	ontology	over_represented_adj_pval	under_represented_adj_pval	term_short	overrep
+GO:1990904	5.56350582383209e-08	1	111	290	ribonucleoprotein complex	CC	0.000444548244289757	1	ribonucleoprotein complex	2.22190022010271
+GO:0003723	1.39128626350191e-05	0.999993521009995	177	594	RNA binding	MF	0.0267516522746147	1	RNA binding	1.72976216061322
+GO:1901360	1.21538965447581e-05	0.999994573625892	216	1050	organic cyclic compound metabolic process	BP	0.0267516522746147	1	organic cyclic compound metabo	1.1941641337386
+GO:0034641	1.27729795354142e-05	0.999995565449724	218	1065	cellular nitrogen compound metabolic process	BP	0.0267516522746147	1	cellular nitrogen compound met	1.18824626244464
+GO:0046483	2.39686713321683e-05	0.99998906093927	213	1044	heterocycle metabolic process	BP	0.0335417301248789	1	heterocycle metabolic process	1.18434621341811
+GO:0006725	2.44218962839768e-05	0.999988848941641	213	1044	cellular aromatic compound metabolic process	BP	0.0335417301248789	1	cellular aromatic compound met	1.18434621341811

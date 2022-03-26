@@ -1,0 +1,356 @@
+---
+title: "Parse raw data"
+author:
+  - name: "Tom Smith"
+    affiliation: "Cambridge Centre for Proteomics"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+abstract: | 
+  Here we parse the raw data for the total, and succinyl LOPITs. 
+output:
+  pdf_document:
+  html_notebook: default
+geometry: margin=1in
+fontsize: 11pt
+---
+
+
+```{r}
+
+library(tidyverse)
+library(camprotR)
+library(MSnbase)
+library(here)
+```
+
+```{r}
+infile_total_psm <- here("raw/Unmod_PSMs.txt")
+infile_succ_psm = here("raw/Suc_PSMs.txt")
+
+protein_fasta_inf <- here("shared_files/Uniprot_Human_Anja_April2019.fasta")
+
+cfasta <- here('shared_files/cRAP_FullIdentifiers.fasta')
+```
+
+
+Make the cRAP list for filtering
+```{r}
+bs.fasta <- Biostrings::fasta.index(cfasta, seqtype = "AA")
+
+# Extract the UniProt accessions 
+crap.accessions <- bs.fasta %>% 
+  pull(desc) %>% 
+  stringr::str_extract_all("(?<=\\|).*?(?=\\|)") %>% 
+  unlist()
+
+
+
+```
+
+
+
+Parse the PSM level data
+```{r}
+raw_psm <- NULL
+raw_psm$unmod  <- parse_features(read.delim(infile_total_psm),
+                                 TMT=TRUE, level='PSM',
+                                 crap_proteins=crap.accessions, unique_master=TRUE)
+
+raw_psm$succ <- parse_features(read.delim(infile_succ_psm),
+                               TMT=TRUE, level='PSM',
+                               crap_proteins=crap.accessions, unique_master=TRUE)
+
+raw_psm %>% lapply(dim)
+```
+
+
+Parse the PTM scores, add filtered_* columns to detail filtering.
+```{r}
+
+# We need to remove some of the modifications from the ptmRS best site probability column
+raw_psm$succ$ptmRS.Best.Site.Probabilities_updated <- raw_psm$succ$ptmRS.Best.Site.Probabilities %>%
+  strsplit(split = '; ') %>%
+  sapply(function(mod_details){
+    keep <- !grepl('TMT|Deamidated|Oxidation', mod_details)
+    paste(mod_details[keep], collapse='; ')
+    })
+
+raw_psm$succ <- parse_PTM_scores(raw_psm$succ, ptm_col="ptmRS.Best.Site.Probabilities_updated", threshold=75)
+
+raw_psm$succ <- raw_psm$succ %>% filter(filtered_score!="") # The filtering doesn't actually take place until this step 
+raw_psm %>% lapply(dim)
+```
+
+
+Add the position of the succinylation 
+```{r}
+raw_psm$succ <- raw_psm$succ %>% add_PTM_positions(protein_fasta_inf)
+
+```
+
+Add the positions of the peptides
+
+```{r}
+raw_psm$succ <- raw_psm$succ %>% add_peptide_positions(protein_fasta_inf)
+
+raw_psm %>% lapply(dim)
+```
+
+Convert to MSnSets
+```{r}
+
+sample_infile = here("raw/samples.tsv")
+sample_info <- read.delim(sample_infile) %>% tibble::column_to_rownames('Tag')
+sample_info <- sample_info %>% filter(Sample_name!='Total cell lysate')
+rownames(sample_info)[10] <- '131'
+
+makeMsnset <- function(obj, sinfo){
+  
+  abundance_cols <- colnames(obj)[grepl('Abundance.', colnames(obj))]
+
+  psm_e <- as.matrix(obj[,abundance_cols])
+  psm_f <- obj[,setdiff(colnames(obj), abundance_cols)]
+    
+  # update the column names to remove the 'Abundance.` prefix
+  colnames(psm_e) <- gsub('Abundance.', '', colnames(psm_e))
+  print(colnames(psm_e))
+  print(rownames(sinfo))
+  psm_e <- psm_e[,rownames(sinfo)]
+
+  res <- MSnbase::MSnSet(exprs=psm_e, fData=psm_f, pData=sinfo)
+  
+  #res <- res[,pData(res)$Sample_name!='Total cell lysate']
+  
+  return(res)
+}
+
+psm_res <- raw_psm %>% lapply(function(x) makeMsnset(x, sample_info))
+psm_res %>% lapply(dim)
+```
+
+Remove features without quantification values
+```{r}
+
+psm_res <- psm_res %>% lapply(function(x){
+  x <- x[rowSums(!is.na(exprs(x)))>0, ]
+  camprotR:::message_parse(fData(x), 'Master.Protein.Accessions', "features without quantification removed")
+  x  
+})
+psm_res %>% lapply(dim)
+```
+```{r}
+psm_res %>% lapply(plot_TMT_notch)
+```
+OK, so as expected, with lots of lower intensity PSMs, the notch is more prominent in the succinylation sample, so there will be some underestimation of very low intensities in the succinyl LOPIT (see https://pubs.acs.org/doi/10.1021/acs.jproteome.7b00092 & https://www.biorxiv.org/content/10.1101/2021.07.18.452841v1.full (in print))
+
+Excluding PSMs with SN<5 or interference > 50%
+```{r}
+
+psm_res <- psm_res %>% lapply(function(x) camprotR::filter_TMT_PSMs(x, inter_thresh=50, sn_thresh=5))
+psm_res %>% lapply(dim)
+```
+Note, this also makes the notch less prominent
+```{r}
+psm_res %>% lapply(plot_TMT_notch)
+```
+
+
+
+Plot missing values
+```{r, fig.height=4, fig.width=6}
+library(RColorBrewer)
+psm_res %>% lapply(function(x){
+  
+  print(table(rowSums(is.na(exprs(x)))))
+
+  p <- x[rowSums(is.na(exprs(x)))>0,] %>% exprs() %>% data.frame() %>% naniar::vis_miss(cluster=TRUE) + theme(axis.text.x=element_text(angle=90))
+  print(p)
+  
+  x %>% log(base=2) %>% naplot(col=brewer.pal(n = 8, name = "YlGnBu")[2:8])
+
+  x %>% plotNA(pNA=0) + xlab('PSM index (ordered by data completeness)') + theme_camprot()
+
+  return(NULL)
+})
+
+```
+OK, so the majority of PSMs have no missing values, even for succinyl LOPIT, but where there are missing values, these are generally in the last fractions. We expect this is just due to values falling below the threshold of detection. In which case, should see relationship to average signal:noise for the PSM as a whole
+
+```{r}
+psm_res %>% names() %>% lapply(function(x){
+  p <- camprotR::plot_missing_SN(psm_res[[x]]) +
+    ggtitle(x)
+})
+
+psm_res %>% names() %>% lapply(function(x){
+  p <- camprotR::plot_missing_SN_per_sample(psm_res[[x]]) +
+    ggtitle(x)
+})
+
+```
+Yes, looks like missing is due to low intensity.
+
+
+Below we impute up to three missing values per PSM, using KNN (k=10) after performing sum normalisation on the rows first (to make sure the nearest neighbours have the same profile over the tags, rather than just the same overall intensity). Sum normalisation is reversed after imputation.
+
+```{r}
+library(OptProc)
+
+ImputeMissing <- function(obj, missing=3, method="sn-knn", k=10){
+  exprs(obj)[exprs(obj)==0]<- NA
+  cat(sprintf("Discarding %s entries with more than %s missing values",
+              sum(rowSums(is.na(exprs(obj)))>missing), missing))
+  print(dim(obj))
+  obj <- obj[rowSums(is.na(exprs(obj)))<=missing,]
+  print(dim(obj))
+  
+  proteins_with_imputation <- rownames(obj[rowSums(is.na(exprs(obj)))>0,])
+  print(length(proteins_with_imputation))
+  
+  if(method=="na"){
+    obj_impute <- obj
+  }
+  else{
+    sink("/dev/null")
+    obj_impute <- OptProc::imputeOptProc(obj, method=method, k=k)
+    sink()
+  }
+  
+  fData(obj_impute)$imputed <- ifelse(rownames(obj_impute) %in% proteins_with_imputation, "Imputed", "Not imputed")
+  print(table(fData(obj_impute)$imputed))
+
+  invisible(obj_impute)
+}
+```
+
+```{r}
+psm_res_imp <- psm_res %>% lapply(ImputeMissing)
+```
+
+```{r}
+psm_res_imp %>% names() %>% lapply(function(x){
+  p <- camprotR::plot_quant(log(psm_res_imp[[x]], base=2)) +
+    ggtitle(x)
+})
+```
+
+
+Now, let's center median normalise the PSM level quantification. Note that we don't need to do this for the downstream analysis but it makes the linear plots more easy to interpret.
+
+
+```{r}
+
+psm_res_imp_cm <- psm_res_imp %>% lapply(function(x){
+  cm <- x %>% log(base=2) %>% MSnbase::normalise(method='diff.median')
+  exprs(cm) <- 2^(exprs(cm))
+  return(cm)
+})
+
+psm_res_imp_cm %>% names() %>% lapply(function(x){
+  p <- camprotR::plot_quant(log(psm_res_imp_cm[[x]], base=2)) +
+    ggtitle(x)
+})
+```
+```{r}
+head(fData(psm_res_imp_cm$succ)$filtered_ptm)
+succ_pep
+```
+
+Combine PSMs to PTM phopeptides. Note that we are summarising PTM peptides using combination of Sequence and PTM position(s)
+```{r}
+
+ptm_pep_group <- paste(fData(psm_res_imp_cm$succ)$Sequence, fData(psm_res_imp_cm$succ)$ptm_position, sep=': ')
+print(length(ptm_pep_group))
+print(length(unique(ptm_pep_group)))
+
+succ_pep <- MSnbase::combineFeatures(psm_res_imp_cm$succ, groupBy=ptm_pep_group, method='sum')
+succ_pep
+```
+```{r}
+fData(psm_res_imp_cm$unmod)$Sequence <- toupper(fData(psm_res_imp_cm$unmod)$Annotated.Sequence)
+pep_group <- fData(psm_res_imp_cm$unmod)$Sequence
+print(length(pep_group))
+print(length(unique(pep_group)))
+
+unmod_pep <- MSnbase::combineFeatures(psm_res_imp_cm$unmod, groupBy=pep_group, method='sum')
+
+prot_group <- fData(psm_res_imp_cm$unmod)$Master.Protein.Accessions
+print(length(prot_group))
+print(length(unique(prot_group)))
+
+unmod_prot <- MSnbase::combineFeatures(psm_res_imp_cm$unmod, groupBy=prot_group, method='sum')
+```
+
+Before we save out the MsnSets, we need to add the markers.
+```{r}
+markers_df <- read.delim(here("shared_files/markers_9B_hyperLOPIT_vs_DC.csv"), sep=",", header=FALSE, stringsAsFactors=FALSE)[,1:2]
+
+markers_df$V2 <- Hmisc::capitalize(tolower(markers_df$V2))
+markers_df$V2 <- recode(markers_df$V2,
+                        "Ribosome 40s"="Ribosome",
+                        "Ribosome 60s"="Ribosome",
+                        "Nucleus-chromatin"="Nucleus",
+                        "Er"="ER",
+                        "Pm"="PM")
+
+markers_proteins <- markers_df$V2
+names(markers_proteins) <- markers_df$V1
+
+
+unmod_prot <- pRoloc::addMarkers(unmod_prot, markers_proteins)
+
+```
+Below, we add the peptide-level markers. Note that we need to map from the Uniprot accession for the marker proteins to our unique identifier in order to add markers to the MsnSet object. 
+```{r}
+
+pep_to_prot <- unmod_pep %>%
+  fData() %>%
+  tibble::rownames_to_column("Sequence_ID") %>%
+  dplyr::select("Sequence_ID","Master.Protein.Accessions") %>%
+  unique()
+
+markers_peptide_df <- pep_to_prot %>%
+  merge(markers_df, by.x="Master.Protein.Accessions", by.y="V1") # merge markers with unique identifiers
+
+markers_peptides <- markers_peptide_df$V2
+names(markers_peptides) <- markers_peptide_df$Sequence_ID
+
+
+unmod_pep <- pRoloc::addMarkers(unmod_pep, markers_peptides)
+```
+
+
+```{r}
+succ_pep_to_prot <- succ_pep %>%
+  fData() %>%
+  tibble::rownames_to_column("Sequence_ID") %>%
+  dplyr::select("Sequence_ID","Master.Protein.Accessions") %>%
+  unique()
+
+succ_markers_peptide_df <- succ_pep_to_prot %>%
+  merge(markers_df, by.x="Master.Protein.Accessions", by.y="V1") # merge markers with unique identifiers
+
+succ_markers_peptides <- succ_markers_peptide_df$V2
+names(succ_markers_peptides) <- succ_markers_peptide_df$Sequence_ID
+
+
+succ_pep <- pRoloc::addMarkers(succ_pep, succ_markers_peptides)
+```
+Finally, we row sum normalise
+```{r}
+unmod_prot <- normalise(unmod_prot, method='sum')
+unmod_pep <- normalise(unmod_pep, method='sum')
+succ_pep <- normalise(succ_pep, method='sum')
+```
+
+
+Now, we save out the final MsnSet object for use in later notebooks.
+```{r}
+saveRDS(unmod_prot, here("results/unmod_prot.rds"))
+saveRDS(unmod_pep, here("results/unmod_pep.rds"))
+saveRDS(succ_pep, here("results/succ_pep.rds"))
+
+
+
+```
+
+

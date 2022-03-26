@@ -1,0 +1,169 @@
+---
+title: "Explore resolution"
+author:
+  - name: "Tom Smith"
+    affiliation: "Cambridge Centre for Proteomics"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+abstract: | 
+  Here, we explore the resolution at protein and peptide-level
+  
+output:
+  pdf_document:
+  html_notebook: default
+geometry: margin=1in
+fontsize: 11pt
+---
+
+Here we explore the resolution for unmodified and modified peptides and unmodified proteins. In a later notebook we will look for modified peptides which have a different classification to the unmodified protein.
+```{r}
+library(MSnbase)
+library(pRoloc)
+library(pRolocExt)
+library(camprotR)
+library(tidyverse)
+
+
+marker_colours <- getStockcol()[c(1:5, 7:11)]
+```
+
+```{r}
+unmod_prot <- readRDS(here("results/unmod_prot.rds"))
+unmod_pep <- readRDS(here("results/unmod_pep.rds"))
+succ_pep <- readRDS(here("results/succ_pep.rds"))
+
+all_data <- list('Protein'=unmod_prot, 'Peptide (unmodified)'=unmod_pep, 'Peptide (succinylated)'=succ_pep)
+```
+
+
+First, let's look at the protein level data for the unmodified proteins as this is the usual level we work from in LOPIT.
+
+```{r}
+
+all_data %>% names() %>% lapply(function(x){
+  p <- plotConsProfiles(mrkConsProfiles(all_data[[x]]), plot=FALSE) +
+    geom_vline(xintercept=10.5, size=0.25) +
+    geom_vline(xintercept=20.5, size=0.25) +
+    scale_x_discrete(labels=pData(unmod_prot)$Sample_name) +
+    theme(axis.text.x=element_text(size=8, angle=90, vjust=0.5, hjust=1)) +
+    ggtitle(x)
+
+})
+
+```
+
+Now, PCA projections
+```{r}
+
+PCAres <- function(obj, title){
+  plot2D(obj, "markers", method='hexbin', main=title)
+  plot2D(obj, "markers", method='hexbin', dims=c(3,4), main=title)
+
+  point_cex <- ifelse(grepl("Peptide", title), 0.5, 1)
+  print(point_cex)
+  plot2D(obj, "markers", main=title, cex=point_cex, col=marker_colours)
+  addLegend(obj, where='bottomright', cex=0.7, col=marker_colours)
+  plot2D(obj, "markers", dims=c(3,4), main=title, cex=point_cex, col=marker_colours)
+  addLegend(obj, where='bottomright', cex=0.7, col=marker_colours)
+}
+
+all_data %>% names() %>% lapply(function(x) PCAres(all_data[[x]], x))
+
+```
+
+
+
+Below, we plot the succinylated peptides onto the protein profiles by using the protein PCA rotations.
+
+```{r}
+unmod <- all_data$Protein
+mod <- all_data$`Peptide (succinylated)`
+dims <- c(1,2)
+pch <- 20
+size <- 1
+alpha <- .5
+
+model <- prcomp(exprs(unmod), scale=TRUE, center=TRUE) #  run PCA manually to get rotations
+b_pca <- data.frame(predict(model, exprs(mod))) # project modified peptides using umod protein
+.pca <- make_proj(unmod, method='PCA', "markers", dims=dims)
+
+cols_labels <- colnames(.pca)[1:2]
+
+.pca <- .pca %>% data.frame()
+
+cols <- colnames(.pca)[1:2]
+
+p <- .pca %>%
+  ggplot(aes(!!sym(cols[[1]]), !!sym(cols[[2]]),
+             colour=markers,
+             alpha=markers=='unknown',
+             size=markers=='unknown')) +
+  geom_point() +
+  theme_camprot(border=FALSE, base_family='sans') +
+  xlab(cols_labels[[1]]) +
+  ylab(cols_labels[[2]]) +
+  scale_colour_manual(values=c(getStockcol()[1:10], colour='grey'), name='') +
+  scale_alpha_manual(values=c(1, 0.25), guide=FALSE) +
+  scale_size_manual(values=c(1, 0.5), guide=FALSE)
+
+print(p)
+
+
+
+p2 <- p + geom_point(data=b_pca,
+                     aes_string(sprintf("PC%s", dims[1]), sprintf("PC%s", dims[2])),
+                     colour="black", size=size, pch=pch, alpha=alpha)
+
+print(p2)  
+```
+
+
+```{r}
+
+plotModPepOntoUnmodProt <- function(unmod, mod, dims=c(1,2), pch=20, size=1, alpha=.5){
+
+  model <- prcomp(exprs(unmod), scale=TRUE, center=TRUE) #  run PCA manually to get rotations
+  b_pca <- data.frame(predict(model, exprs(mod))) # project modified peptides using umod protein
+  .pca <- make_proj(unmod, method='PCA', "markers", dims=dims)
+  
+  cols_labels <- colnames(.pca)[1:2]
+  
+  .pca <- .pca %>% data.frame()
+  
+  cols <- colnames(.pca)[1:2]
+  
+  p <- .pca %>%
+    ggplot(aes(!!sym(cols[[1]]), !!sym(cols[[2]]),
+               colour=markers,
+               alpha=markers=='unknown',
+               size=markers=='unknown')) +
+    geom_point() +
+    theme_camprot(border=FALSE, base_family='sans') +
+    xlab(cols_labels[[1]]) +
+    ylab(cols_labels[[2]]) +
+    scale_colour_manual(values=c(marker_colours, colour='grey'), name='') +
+    scale_alpha_manual(values=c(1, 0.25), guide=FALSE) +
+    scale_size_manual(values=c(1, 0.5), guide=FALSE)
+  
+  print(p)
+  
+  
+  
+  p2 <- p + geom_point(data=b_pca,
+                       aes_string(sprintf("PC%s", dims[1]), sprintf("PC%s", dims[2])),
+                       colour="black", size=size, pch=pch, alpha=alpha)
+  
+  print(p2) 
+    
+  invisible(list("only_umod"=p, "inc_mod"=p2))
+}
+
+
+projected_onto_protein <- plotModPepOntoUnmodProt(all_data$Protein, all_data$`Peptide (succinylated)`, size=0.5)
+
+projected_onto_peptide <- plotModPepOntoUnmodProt(all_data$`Peptide (unmodified)`, all_data$`Peptide (succinylated)`, size=0.5)
+ggsave(here("figures/peptide_pca.png"), projected_onto_peptide$inc_mod)
+ggsave(here("figures/peptide_pca.pdf"), projected_onto_peptide$inc_mod)
+
+
+```
+
